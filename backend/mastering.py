@@ -8,6 +8,9 @@ from scipy.ndimage import maximum_filter1d
 
 os.makedirs("processed", exist_ok=True)
 
+DEFAULT_DSP_OVERSAMPLE = 4
+
+
 # ─── Numba acceleration ────────────────────────────────────────────────────────
 try:
     import numba as nb
@@ -264,7 +267,7 @@ def reverb_simple(audio: np.ndarray, sr: int,
 
 def limiter(audio: np.ndarray, sr: int,
             ceiling: float = 0.95, release_ms: float = 80.0,
-            lookahead_ms: float = 5.0, oversample: int = 4) -> np.ndarray:
+            lookahead_ms: float = 5.0, oversample: int = DEFAULT_DSP_OVERSAMPLE) -> np.ndarray:
     """True Peak limiter brick-wall con lookahead, ganancia suavizada, oversampling
     y detección LINKEADA entre canales (estéreo).
 
@@ -379,7 +382,7 @@ def transient_shaper(audio: np.ndarray, sr: int,
 
 def harmonic_saturation(audio: np.ndarray,
                         drive: float = 0.2, mode: str = "tape",
-                        mix: float = 1.0, oversample: int = 4) -> np.ndarray:
+                        mix: float = 1.0, oversample: int = DEFAULT_DSP_OVERSAMPLE) -> np.ndarray:
     """Saturación armónica (tape/tube) con waveshaper tanh.
 
     BUGFIX (saturación "extremadamente fuerte/distorsionada"):
@@ -432,9 +435,9 @@ def stereo_enhancer(audio: np.ndarray, sr: int,
     sos_hp = butter(2, bass_mono_freq, btype="highpass", fs=sr, output="sos")
     left, right = audio[0], audio[1]
     mono_sum = (left + right) * 0.5
-    bass = np.stack([sosfilt(sos_lp, mono_sum), sosfilt(sos_lp, mono_sum)])
-    high_l = sosfilt(sos_hp, left)
-    high_r = sosfilt(sos_hp, right)
+    bass = np.stack([sosfiltfilt(sos_lp, mono_sum), sosfiltfilt(sos_lp, mono_sum)])
+    high_l = sosfiltfilt(sos_hp, left)
+    high_r = sosfiltfilt(sos_hp, right)
     mid  = (high_l + high_r) * 0.5
     side = (high_l - high_r) * 0.5 * width
     if haas_delay_ms > 0.0:
@@ -1025,7 +1028,7 @@ def compressor(audio: np.ndarray, sr: int,
                attack_ms: float = 10.0,
                release_ms: float = 100.0,
                makeup_db: float = 0.0,
-               oversample: int = 4) -> tuple:
+               oversample: int = DEFAULT_DSP_OVERSAMPLE) -> tuple:
     """Compresor de banda ancha (feed-forward, peak-detector) con make-up gain.
 
     threshold: umbral lineal 0..1 (se convierte internamente a dBFS).
@@ -1107,7 +1110,8 @@ def multiband_compressor(audio: np.ndarray, sr: int,
                          high_attack_ms: float = 20.0,
                          high_release_ms: float = 150.0,
                          high_makeup_db: float = 0.0,
-                         bypass: bool = True) -> tuple:
+                         bypass: bool = True,
+                         oversample: int = DEFAULT_DSP_OVERSAMPLE) -> tuple:
     if bypass:
         return audio, {"low_gr_db": 0.0, "mid_gr_db": 0.0, "high_gr_db": 0.0,
                        "low_in_db": 0.0, "mid_in_db": 0.0, "high_in_db": 0.0,
@@ -1136,27 +1140,17 @@ def multiband_compressor(audio: np.ndarray, sr: int,
     mid_in_db  = _band_rms_db(mid)
     high_in_db = _band_rms_db(high)
 
-    # Función compressor simple (redefinida localmente para evitar dependencias)
     def _compressor(ch, threshold, ratio, attack_ms, release_ms, makeup_db):
-        threshold_db = 20.0 * np.log10(max(threshold, 1e-9))
+        compressed, meter = compressor(
+            ch, sr,
+            threshold=threshold, ratio=ratio,
+            attack_ms=attack_ms, release_ms=release_ms,
+            makeup_db=makeup_db, oversample=oversample,
+        )
+        gr_db = np.full(ch.shape[-1], meter.get("gr_db", 0.0), dtype=np.float64)
         if ch.ndim > 1:
-            # Señal multicanal (estéreo): procesar cada canal por separado,
-            # ya que _smooth_envelope espera una señal 1D.
-            outs, grs = [], []
-            for c in range(ch.shape[0]):
-                out_c, gr_c = _compressor(ch[c], threshold, ratio, attack_ms, release_ms, makeup_db)
-                outs.append(out_c)
-                grs.append(gr_c)
-            return np.stack(outs), np.stack(grs)
-        env = _smooth_envelope(np.abs(ch), sr, attack_ms, release_ms)
-        env_db = 20.0 * np.log10(env + 1e-9)
-        if HAS_NUMBA:
-            gr_db = _compute_gain_reduction_numba(env_db, threshold_db, ratio)
-        else:
-            gr_db = _soft_knee_gain_reduction_np(env_db, threshold_db, ratio)
-        gain_linear = 10.0 ** (gr_db / 20.0)
-        makeup = 10.0 ** (makeup_db / 20.0)
-        return ch * gain_linear * makeup, gr_db
+            gr_db = np.tile(gr_db, (ch.shape[0], 1))
+        return compressed, gr_db
 
     low_comp,  low_gr_arr  = _compressor(low,  low_threshold,  low_ratio,  low_attack_ms,  low_release_ms,  low_makeup_db)
     mid_comp,  mid_gr_arr  = _compressor(mid,  mid_threshold,  mid_ratio,  mid_attack_ms,  mid_release_ms,  mid_makeup_db)
@@ -1306,7 +1300,7 @@ def apply_mastering_chain(
         attack_ms=comp_attack_ms,
         release_ms=comp_release_ms,
         makeup_db=comp_makeup_db,
-        oversample=4,
+        oversample=DEFAULT_DSP_OVERSAMPLE,
     )
 
     # ── 5. Compresor multibanda (bypass por defecto) ──────────────────────
@@ -1330,13 +1324,14 @@ def apply_mastering_chain(
         high_release_ms=mb_high_release_ms,
         high_makeup_db=mb_high_makeup_db,
         bypass=mb_bypass,
+        oversample=DEFAULT_DSP_OVERSAMPLE,
     )
 
     # ── 6. Saturación armónica (opcional, oversampling x4) ─────────────────
     if saturation_drive > 0.0:
         audio = harmonic_saturation(audio, drive=saturation_drive,
                                     mode=saturation_mode, mix=saturation_mix,
-                                    oversample=4)
+                                    oversample=DEFAULT_DSP_OVERSAMPLE)
 
     # ── 7. Mid/Side gain (opcional) ────────────────────────────────────────
     if audio.shape[0] == 2 and (mid_gain_db != 0.0 or side_gain_db != 0.0):
@@ -1374,7 +1369,8 @@ def apply_mastering_chain(
     pre_peak_db = float(20.0 * np.log10(np.max(np.abs(mono_pre)) + 1e-9))
 
     # ── 10. Limitador brick-wall con lookahead (siempre activo, al final) ─
-    audio = limiter(audio, sr, ceiling=limiter_ceiling, release_ms=limiter_release_ms, lookahead_ms=5.0)
+    audio = limiter(audio, sr, ceiling=limiter_ceiling, release_ms=limiter_release_ms, lookahead_ms=5.0,
+                    oversample=DEFAULT_DSP_OVERSAMPLE)
 
     # VU post-limiter
     mono_post = audio.mean(axis=0) if audio.ndim == 2 else audio
@@ -1509,6 +1505,13 @@ def process_audio(
         mb_bypass=mb_bypass,
         hp_cutoff=hp_cutoff,
         high_shelf_gain_db=high_shelf_gain_db,
+        high_shelf_freq_hz=high_shelf_freq_hz,
+        mb_stereo_bypass=mb_stereo_bypass,
+        mb_stereo_low_width=mb_stereo_low_width,
+        mb_stereo_mid_width=mb_stereo_mid_width,
+        mb_stereo_high_width=mb_stereo_high_width,
+        mb_stereo_low_crossover=mb_stereo_low_crossover,
+        mb_stereo_high_crossover=mb_stereo_high_crossover,
         eq1_freq=eq1_freq, eq1_gain=eq1_gain, eq1_q=eq1_q,
         eq2_freq=eq2_freq, eq2_gain=eq2_gain, eq2_q=eq2_q,
         eq3_freq=eq3_freq, eq3_gain=eq3_gain, eq3_q=eq3_q,
@@ -1767,7 +1770,7 @@ def match_dynamics_bands(audio: np.ndarray, sr: int,
             band_out, band_meter = compressor(
                 band_audio, sr, threshold=threshold_lin, ratio=ratio,
                 attack_ms=attack_by_band[name], release_ms=release_by_band[name],
-                makeup_db=0.0, oversample=2,
+                makeup_db=0.0, oversample=DEFAULT_DSP_OVERSAMPLE,
             )
             out += band_out
             meta[name] = {"applied": True, "ratio": round(ratio, 2), "gap_db": round(gap, 2), **band_meter}
@@ -1794,7 +1797,7 @@ def match_lra(audio: np.ndarray, sr: int, own_lra: float, ref_lra: float,
         threshold_lin = float(np.clip(10.0 ** ((rms_db + 1.0) / 20.0), 0.05, 0.95))
         audio, comp_meter = compressor(audio, sr, threshold=threshold_lin, ratio=ratio,
                                        attack_ms=30.0, release_ms=300.0, makeup_db=0.0,
-                                       oversample=2)
+                                       oversample=DEFAULT_DSP_OVERSAMPLE)
         meta.update({"applied": True, "ratio": round(ratio, 2), **comp_meter})
     return audio, meta
 
@@ -2004,7 +2007,8 @@ def process_audio_with_reference(
     # ── 6. Limitador, techo aproximado al pico de la referencia ───────────
     ref_peak_db = min(analysis_reference["peak_db"], -0.1)
     ceiling = float(np.clip(10.0 ** (ref_peak_db / 20.0), 0.5, 0.99))
-    audio = limiter(audio, sr, ceiling=ceiling, release_ms=limiter_release_ms, lookahead_ms=5.0)
+    audio = limiter(audio, sr, ceiling=ceiling, release_ms=limiter_release_ms, lookahead_ms=5.0,
+                    oversample=DEFAULT_DSP_OVERSAMPLE)
 
     analysis_after = analyze_audio(audio, sr)
     final_bands_db = spectral_energy_at_bands(audio, sr, band_edges)
