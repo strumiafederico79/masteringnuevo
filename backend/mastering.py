@@ -9,6 +9,15 @@ from scipy.ndimage import maximum_filter1d
 os.makedirs("processed", exist_ok=True)
 
 DEFAULT_DSP_OVERSAMPLE = 4
+OVERSAMPLING_MODES = {"off": 1, "draft": 1, "fast": 2, "quality": 4, "ultra": 8}
+
+def resolve_oversample(mode: str | int | None = "quality") -> int:
+    """Resolve oversampling quality names to integer factors."""
+    if mode is None:
+        return DEFAULT_DSP_OVERSAMPLE
+    if isinstance(mode, (int, np.integer)):
+        return max(1, int(mode))
+    return OVERSAMPLING_MODES.get(str(mode).lower(), DEFAULT_DSP_OVERSAMPLE)
 
 
 # ─── Numba acceleration ────────────────────────────────────────────────────────
@@ -1028,67 +1037,72 @@ def compressor(audio: np.ndarray, sr: int,
                attack_ms: float = 10.0,
                release_ms: float = 100.0,
                makeup_db: float = 0.0,
-               oversample: int = DEFAULT_DSP_OVERSAMPLE) -> tuple:
-    """Compresor de banda ancha (feed-forward, peak-detector) con make-up gain.
+               oversample: int = DEFAULT_DSP_OVERSAMPLE,
+               stereo_link: bool = True,
+               return_gain_curve: bool = False) -> tuple:
+    """Compresor feed-forward con soft-knee, make-up gain y link estéreo opcional.
 
     threshold: umbral lineal 0..1 (se convierte internamente a dBFS).
     ratio: relación de compresión, ej. 4.0 = "4:1".
-    oversample: factor de sobremuestreo (por defecto x4) para suavizar el
-    detector de envolvente/ganancia y reducir artefactos de aliasing.
+    oversample: factor de sobremuestreo para detector/ganancia.
+    stereo_link: usa una sola curva de ganancia para L/R y preserva el panorama.
+    return_gain_curve: devuelve también la curva real de reducción para meters.
     """
+    in_db = _band_rms_db(audio)
     if ratio <= 1.0:
-        # Sin compresión real: no tiene sentido gastar cómputo.
-        db = _band_rms_db(audio)
-        return audio, {"gr_db": 0.0, "in_db": round(db, 2), "out_db": round(db, 2)}
+        out = audio * (10.0 ** (makeup_db / 20.0))
+        meter = {"gr_db": 0.0, "in_db": round(in_db, 2), "out_db": round(_band_rms_db(out), 2), "stereo_link": bool(stereo_link)}
+        gr_shape = audio.shape if audio.ndim > 1 else (audio.shape[-1],)
+        gr_arr = np.zeros(gr_shape, dtype=np.float64)
+        return (out, meter, gr_arr) if return_gain_curve else (out, meter)
 
     threshold_db = 20.0 * np.log10(max(threshold, 1e-9))
-    in_db = _band_rms_db(audio)
+    ovs = max(1, int(oversample))
 
-    def process_channel(ch):
-        if oversample and oversample > 1:
-            sr_up = sr * oversample
-            up = resample_poly(ch, oversample, 1)
+    def gain_reduction(abs_signal):
+        if ovs > 1:
+            sr_up = sr * ovs
+            up = resample_poly(abs_signal, ovs, 1)
             env = _smooth_envelope(np.abs(up), sr_up, attack_ms, release_ms)
             env_db = 20.0 * np.log10(env + 1e-9)
             if HAS_NUMBA:
                 gr_db_up = _compute_gain_reduction_numba(env_db, threshold_db, ratio)
             else:
                 gr_db_up = _soft_knee_gain_reduction_np(env_db, threshold_db, ratio)
-            gain_linear_up = 10.0 ** (gr_db_up / 20.0)
-            out_up = up * gain_linear_up
-            out = resample_poly(out_up, 1, oversample)[:len(ch)]
-            gr_db = resample_poly(gr_db_up, 1, oversample)[:len(ch)]
-        else:
-            env = _smooth_envelope(np.abs(ch), sr, attack_ms, release_ms)
-            env_db = 20.0 * np.log10(env + 1e-9)
-            if HAS_NUMBA:
-                gr_db = _compute_gain_reduction_numba(env_db, threshold_db, ratio)
-            else:
-                gr_db = _soft_knee_gain_reduction_np(env_db, threshold_db, ratio)
-            gain_linear = 10.0 ** (gr_db / 20.0)
-            out = ch * gain_linear
-        return out, gr_db
+            return resample_poly(gr_db_up, 1, ovs)[:len(abs_signal)]
+        env = _smooth_envelope(np.abs(abs_signal), sr, attack_ms, release_ms)
+        env_db = 20.0 * np.log10(env + 1e-9)
+        if HAS_NUMBA:
+            return _compute_gain_reduction_numba(env_db, threshold_db, ratio)
+        return _soft_knee_gain_reduction_np(env_db, threshold_db, ratio)
 
     makeup = 10.0 ** (makeup_db / 20.0)
 
     if audio.ndim == 1:
-        out, gr_arr = process_channel(audio)
-        out = out * makeup
+        gr_arr = gain_reduction(np.abs(audio))
+        out = audio * (10.0 ** (gr_arr / 20.0)) * makeup
+    elif stereo_link:
+        linked_detector = np.max(np.abs(audio), axis=0)
+        linked_gr = gain_reduction(linked_detector)
+        gr_arr = np.tile(linked_gr, (audio.shape[0], 1))
+        out = audio * (10.0 ** (linked_gr / 20.0))[np.newaxis, :] * makeup
     else:
-        outs, grs = [], []
-        for ch in audio:
-            out_c, gr_c = process_channel(ch)
-            outs.append(out_c)
-            grs.append(gr_c)
-        out = np.stack(outs) * makeup
+        grs = [gain_reduction(np.abs(ch)) for ch in audio]
         gr_arr = np.stack(grs)
+        out = audio * (10.0 ** (gr_arr / 20.0)) * makeup
 
     tail = max(1, sr // 8)
     gr_db_mean = float(np.mean(gr_arr[..., -tail:])) if gr_arr.size else 0.0
     out_db = _band_rms_db(out)
 
-    meter = {"gr_db": round(gr_db_mean, 2), "in_db": round(in_db, 2), "out_db": round(out_db, 2)}
-    return out, meter
+    meter = {
+        "gr_db": round(gr_db_mean, 2),
+        "in_db": round(in_db, 2),
+        "out_db": round(out_db, 2),
+        "stereo_link": bool(stereo_link),
+        "oversample": ovs,
+    }
+    return (out, meter, gr_arr) if return_gain_curve else (out, meter)
 
 # ─── Compresor multibanda (solo se usa si se activa) ─────────────────────────
 
@@ -1141,15 +1155,13 @@ def multiband_compressor(audio: np.ndarray, sr: int,
     high_in_db = _band_rms_db(high)
 
     def _compressor(ch, threshold, ratio, attack_ms, release_ms, makeup_db):
-        compressed, meter = compressor(
+        compressed, _meter, gr_db = compressor(
             ch, sr,
             threshold=threshold, ratio=ratio,
             attack_ms=attack_ms, release_ms=release_ms,
             makeup_db=makeup_db, oversample=oversample,
+            stereo_link=True, return_gain_curve=True,
         )
-        gr_db = np.full(ch.shape[-1], meter.get("gr_db", 0.0), dtype=np.float64)
-        if ch.ndim > 1:
-            gr_db = np.tile(gr_db, (ch.shape[0], 1))
         return compressed, gr_db
 
     low_comp,  low_gr_arr  = _compressor(low,  low_threshold,  low_ratio,  low_attack_ms,  low_release_ms,  low_makeup_db)
@@ -1202,6 +1214,8 @@ def apply_mastering_chain(
     use_lufs_normalize: bool = False,   # No se usa
     target_lufs: float = -14.0,         # No se usa
     input_gain_db: float = 0.0,
+    oversample_mode: str = "quality",
+    comp_stereo_link: bool = True,
     comp_threshold: float = 0.5,
     comp_ratio: float = 4.0,
     comp_attack_ms: float = 10.0,
@@ -1261,6 +1275,8 @@ def apply_mastering_chain(
     ninguna normalización de ganancia automática (solo el trim manual de
     input_gain_db, si se especifica).
     """
+    ovs = resolve_oversample(oversample_mode)
+
     # ── 0. Input gain (trim manual, opcional) ──────────────────────────────
     if input_gain_db != 0.0:
         audio = audio * (10.0 ** (input_gain_db / 20.0))
@@ -1300,7 +1316,8 @@ def apply_mastering_chain(
         attack_ms=comp_attack_ms,
         release_ms=comp_release_ms,
         makeup_db=comp_makeup_db,
-        oversample=DEFAULT_DSP_OVERSAMPLE,
+        oversample=ovs,
+        stereo_link=comp_stereo_link,
     )
 
     # ── 5. Compresor multibanda (bypass por defecto) ──────────────────────
@@ -1324,14 +1341,14 @@ def apply_mastering_chain(
         high_release_ms=mb_high_release_ms,
         high_makeup_db=mb_high_makeup_db,
         bypass=mb_bypass,
-        oversample=DEFAULT_DSP_OVERSAMPLE,
+        oversample=ovs,
     )
 
     # ── 6. Saturación armónica (opcional, oversampling x4) ─────────────────
     if saturation_drive > 0.0:
         audio = harmonic_saturation(audio, drive=saturation_drive,
                                     mode=saturation_mode, mix=saturation_mix,
-                                    oversample=DEFAULT_DSP_OVERSAMPLE)
+                                    oversample=ovs)
 
     # ── 7. Mid/Side gain (opcional) ────────────────────────────────────────
     if audio.shape[0] == 2 and (mid_gain_db != 0.0 or side_gain_db != 0.0):
@@ -1370,7 +1387,7 @@ def apply_mastering_chain(
 
     # ── 10. Limitador brick-wall con lookahead (siempre activo, al final) ─
     audio = limiter(audio, sr, ceiling=limiter_ceiling, release_ms=limiter_release_ms, lookahead_ms=5.0,
-                    oversample=DEFAULT_DSP_OVERSAMPLE)
+                    oversample=ovs)
 
     # VU post-limiter
     mono_post = audio.mean(axis=0) if audio.ndim == 2 else audio
@@ -1380,6 +1397,7 @@ def apply_mastering_chain(
     post_corr    = stereo_correlation(audio)
 
     chain_meters = {
+        "config": {"oversample": ovs, "oversample_mode": str(oversample_mode), "comp_stereo_link": bool(comp_stereo_link)},
         "comp": comp_meters,
         "mb": mb_meters,
         "pre_limiter":  {"rms_db": round(pre_rms_db, 2),  "peak_db": round(pre_peak_db, 2)},
@@ -1401,6 +1419,8 @@ def process_audio(
     use_lufs_normalize: bool = False,   # Ignorado
     target_lufs: float = -14.0,         # Ignorado
     input_gain_db: float = 0.0,
+    oversample_mode: str = "quality",
+    comp_stereo_link: bool = True,
     comp_threshold: float = 0.5,
     comp_ratio: float = 4.0,
     comp_attack_ms: float = 10.0,
@@ -1480,6 +1500,8 @@ def process_audio(
         use_lufs_normalize=use_lufs_normalize,
         target_lufs=target_lufs,
         input_gain_db=input_gain_db,
+        oversample_mode=oversample_mode,
+        comp_stereo_link=comp_stereo_link,
         comp_threshold=comp_threshold,
         comp_ratio=comp_ratio,
         comp_attack_ms=comp_attack_ms,
@@ -1633,7 +1655,8 @@ def _soft_clip_curve(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 def compute_reference_eq_curve(src_bands_db: list, ref_bands_db: list, freqs_hz: list,
                                 max_boost_db: float = 6.0, max_cut_db: float = -9.0,
-                                smooth_window: int = 3) -> list:
+                                smooth_window: int = 3,
+                                blend: float = 0.75) -> list:
     """Calcula la curva de EQ (freq, gain_db) necesaria para acercar el balance
     tonal de src hacia ref. Se resta la media global (el loudness se maneja
     aparte, vía LUFS) y se suaviza/clippea para evitar EQs extremas o ásperas.
@@ -1652,6 +1675,8 @@ def compute_reference_eq_curve(src_bands_db: list, ref_bands_db: list, freqs_hz:
       3) Se re-centra después del recorte, porque un soft-knee asimétrico
          (max_boost != |max_cut|) puede introducir un pequeño remanente de
          nivel medio que de otro modo se solaparía con el ajuste de LUFS.
+      4) Se aplica un blend y límites perceptuales por zona para evitar
+         matches 100% demasiado artificiales, especialmente en sub y presencia.
     """
     src = np.array(src_bands_db, dtype=np.float64)
     ref = np.array(ref_bands_db, dtype=np.float64)
@@ -1670,7 +1695,21 @@ def compute_reference_eq_curve(src_bands_db: list, ref_bands_db: list, freqs_hz:
 
     diff = _soft_clip_curve(diff, max_cut_db, max_boost_db)
     diff = diff - np.mean(diff)
-    diff = np.clip(diff, max_cut_db, max_boost_db)
+
+    freqs = np.array(freqs_hz, dtype=np.float64)
+    zone_boost = np.full_like(freqs, max_boost_db, dtype=np.float64)
+    zone_cut = np.full_like(freqs, max_cut_db, dtype=np.float64)
+    zone_boost[freqs < 80.0] = min(max_boost_db, 3.0)
+    zone_cut[freqs < 80.0] = max(max_cut_db, -6.0)
+    presence = (freqs >= 2500.0) & (freqs <= 7000.0)
+    zone_boost[presence] = min(max_boost_db, 3.5)
+    zone_cut[presence] = max(max_cut_db, -6.0)
+    air = freqs >= 10000.0
+    zone_boost[air] = min(max_boost_db, 5.0)
+    zone_cut[air] = max(max_cut_db, -7.0)
+
+    blend = float(np.clip(blend, 0.0, 1.0))
+    diff = np.clip(diff * blend, zone_cut, zone_boost)
 
     return [(float(f), float(g)) for f, g in zip(freqs_hz, diff.tolist())]
 
@@ -1743,7 +1782,8 @@ def apply_matching_fir(audio: np.ndarray, sr: int, taps) -> np.ndarray:
 def match_dynamics_bands(audio: np.ndarray, sr: int,
                          own_crest: dict, ref_crest: dict,
                          bands: list = DYNAMICS_BANDS,
-                         margin_db: float = 1.0) -> tuple:
+                         margin_db: float = 1.0,
+                         oversample: int = DEFAULT_DSP_OVERSAMPLE) -> tuple:
     """Comprime banda por banda solo donde el crest factor propio supera al
     de la referencia por más de `margin_db`. Nunca expande dinámica (si la
     referencia es más dinámica que el track en una banda, se deja intacta
@@ -1770,7 +1810,7 @@ def match_dynamics_bands(audio: np.ndarray, sr: int,
             band_out, band_meter = compressor(
                 band_audio, sr, threshold=threshold_lin, ratio=ratio,
                 attack_ms=attack_by_band[name], release_ms=release_by_band[name],
-                makeup_db=0.0, oversample=DEFAULT_DSP_OVERSAMPLE,
+                makeup_db=0.0, oversample=oversample,
             )
             out += band_out
             meta[name] = {"applied": True, "ratio": round(ratio, 2), "gap_db": round(gap, 2), **band_meter}
@@ -1783,7 +1823,8 @@ def match_dynamics_bands(audio: np.ndarray, sr: int,
     return out, meta
 
 def match_lra(audio: np.ndarray, sr: int, own_lra: float, ref_lra: float,
-             margin: float = 1.0) -> tuple:
+             margin: float = 1.0,
+             oversample: int = DEFAULT_DSP_OVERSAMPLE) -> tuple:
     """Ajusta la macro-dinámica (LRA, rango dinámico "a largo plazo") con un
     compresor tipo 'glue' (attack/release lentos) cuando el track propio es
     notablemente más variable en el tiempo que la referencia. Al igual que
@@ -1797,7 +1838,7 @@ def match_lra(audio: np.ndarray, sr: int, own_lra: float, ref_lra: float,
         threshold_lin = float(np.clip(10.0 ** ((rms_db + 1.0) / 20.0), 0.05, 0.95))
         audio, comp_meter = compressor(audio, sr, threshold=threshold_lin, ratio=ratio,
                                        attack_ms=30.0, release_ms=300.0, makeup_db=0.0,
-                                       oversample=DEFAULT_DSP_OVERSAMPLE)
+                                       oversample=oversample)
         meta.update({"applied": True, "ratio": round(ratio, 2), **comp_meter})
     return audio, meta
 
@@ -1916,6 +1957,8 @@ def process_audio_with_reference(
     eq_max_boost_db: float = 6.0,
     eq_max_cut_db: float = -9.0,
     eq_q: float = 1.3,
+    eq_match_blend: float = 0.75,
+    oversample_mode: str = "quality",
     match_loudness: bool = True,
     match_dynamics: bool = True,
     match_stereo_width: bool = True,
@@ -1943,6 +1986,8 @@ def process_audio_with_reference(
     if preview_seconds is not None:
         audio = _crop_preview(audio, sr, preview_seconds)
 
+    ovs = resolve_oversample(oversample_mode)
+
     analysis_before = analyze_audio(audio, sr)
     analysis_reference = analyze_audio(ref_audio, ref_sr)
 
@@ -1960,7 +2005,8 @@ def process_audio_with_reference(
 
     curve = compute_reference_eq_curve(src_bands_db, ref_bands_db, centers,
                                        max_boost_db=eq_max_boost_db,
-                                       max_cut_db=eq_max_cut_db)
+                                       max_cut_db=eq_max_cut_db,
+                                       blend=eq_match_blend)
 
     # ── 2. EQ de matching (FIR de fase lineal, ver build_matching_fir) ────
     audio = eq_high_pass(audio, sr, cutoff_hz=hp_cutoff)
@@ -1982,11 +2028,12 @@ def process_audio_with_reference(
         own_crest = band_crest_factors(audio, sr)
         ref_crest = band_crest_factors(ref_audio, ref_sr)
         audio, dynamics_band_meta = match_dynamics_bands(
-            audio, sr, own_crest, ref_crest, margin_db=dynamics_margin_db)
+            audio, sr, own_crest, ref_crest, margin_db=dynamics_margin_db,
+            oversample=ovs)
 
         cur_lra = measure_lra(audio, sr)
         audio, lra_meta = match_lra(audio, sr, cur_lra, analysis_reference.get("lra", cur_lra),
-                                    margin=dynamics_margin_db)
+                                    margin=dynamics_margin_db, oversample=ovs)
 
     # ── 4. Ancho estéreo: matching banda por banda (graves/medios/agudos)   ──
     # ── de la correlación L/R contra la referencia. Ver match_stereo_bands. ──
@@ -2008,7 +2055,7 @@ def process_audio_with_reference(
     ref_peak_db = min(analysis_reference["peak_db"], -0.1)
     ceiling = float(np.clip(10.0 ** (ref_peak_db / 20.0), 0.5, 0.99))
     audio = limiter(audio, sr, ceiling=ceiling, release_ms=limiter_release_ms, lookahead_ms=5.0,
-                    oversample=DEFAULT_DSP_OVERSAMPLE)
+                    oversample=ovs)
 
     analysis_after = analyze_audio(audio, sr)
     final_bands_db = spectral_energy_at_bands(audio, sr, band_edges)
@@ -2050,6 +2097,9 @@ def process_audio_with_reference(
             "after":                   match_after,
             "eq_curve_db":             [{"freq_hz": round(f, 1), "gain_db": round(g, 2)} for f, g in curve],
             "loudness_gain_applied_db": round(loudness_gain_db, 2),
+            "eq_match_blend":          round(eq_match_blend, 3),
+            "oversample":              ovs,
+            "oversample_mode":         str(oversample_mode),
             "stereo_width_applied":     round(width_applied, 3),
             "stereo_width_by_band":     stereo_k_applied,
             "dynamics_by_band":         dynamics_band_meta,
