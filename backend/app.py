@@ -384,6 +384,8 @@ async def preview(
     comp_attack_ms: float      = Query(10.0,  ge=0.1,   le=200.0),
     comp_release_ms: float     = Query(100.0, ge=10.0,  le=1000.0),
     comp_makeup_db: float      = Query(0.0,   ge=-12.0, le=24.0),
+    comp_stereo_link: bool     = Query(True, description="Linkea L/R en el compresor para preservar la imagen estéreo"),
+    oversample_mode: str       = Query("quality", pattern="^(off|draft|fast|quality|ultra)$"),
     # EQ
     hp_cutoff: float          = Query(80.0,   ge=20.0,  le=500.0),
     high_shelf_gain_db: float = Query(2.0,    ge=-12.0, le=12.0),
@@ -434,6 +436,8 @@ async def preview(
             use_lufs_normalize=use_lufs_normalize,
             target_lufs=target_lufs,
             input_gain_db=input_gain_db,
+            oversample_mode=oversample_mode,
+            comp_stereo_link=comp_stereo_link,
             comp_threshold=comp_threshold,
             comp_ratio=comp_ratio,
             comp_attack_ms=comp_attack_ms,
@@ -522,6 +526,8 @@ async def master_async(
     comp_attack_ms: float      = Query(10.0,  ge=0.1,   le=200.0),
     comp_release_ms: float     = Query(100.0, ge=10.0,  le=1000.0),
     comp_makeup_db: float      = Query(0.0,   ge=-12.0, le=24.0),
+    comp_stereo_link: bool     = Query(True, description="Linkea L/R en el compresor para preservar la imagen estéreo"),
+    oversample_mode: str       = Query("quality", pattern="^(off|draft|fast|quality|ultra)$"),
     # EQ
     hp_cutoff: float          = Query(80.0,   ge=20.0,  le=500.0),
     high_shelf_gain_db: float = Query(2.0,    ge=-12.0, le=12.0),
@@ -566,6 +572,8 @@ async def master_async(
         use_lufs_normalize=use_lufs_normalize,
         target_lufs=target_lufs,
         input_gain_db=input_gain_db,
+        oversample_mode=oversample_mode,
+        comp_stereo_link=comp_stereo_link,
         comp_threshold=comp_threshold,
         comp_ratio=comp_ratio,
         comp_attack_ms=comp_attack_ms,
@@ -660,6 +668,8 @@ async def master_sync(
     comp_attack_ms: float      = Query(10.0,  ge=0.1,   le=200.0),
     comp_release_ms: float     = Query(100.0, ge=10.0,  le=1000.0),
     comp_makeup_db: float      = Query(0.0,   ge=-12.0, le=24.0),
+    comp_stereo_link: bool     = Query(True, description="Linkea L/R en el compresor para preservar la imagen estéreo"),
+    oversample_mode: str       = Query("quality", pattern="^(off|draft|fast|quality|ultra)$"),
     # EQ
     hp_cutoff: float          = Query(80.0,   ge=20.0,  le=500.0),
     high_shelf_gain_db: float = Query(2.0,    ge=-12.0, le=12.0),
@@ -707,6 +717,8 @@ async def master_sync(
             use_lufs_normalize=use_lufs_normalize,
             target_lufs=target_lufs,
             input_gain_db=input_gain_db,
+            oversample_mode=oversample_mode,
+            comp_stereo_link=comp_stereo_link,
             comp_threshold=comp_threshold,
             comp_ratio=comp_ratio,
             comp_attack_ms=comp_attack_ms,
@@ -764,13 +776,15 @@ async def master_sync(
 # ── Master por referencia (reference-track matching) ───────────────────────────
 def _read_reference_params(
     eq_bands: int, eq_max_boost_db: float, eq_max_cut_db: float, eq_q: float,
+    eq_match_blend: float, oversample_mode: str,
     match_loudness: bool, match_dynamics: bool, match_stereo_width: bool,
     hp_cutoff: float, limiter_release_ms: float, output_format: str,
     dynamics_margin_db: float = 1.0, stereo_blend: float = 0.85,
 ) -> dict:
     return dict(
         eq_bands=eq_bands, eq_max_boost_db=eq_max_boost_db, eq_max_cut_db=eq_max_cut_db,
-        eq_q=eq_q, match_loudness=match_loudness, match_dynamics=match_dynamics,
+        eq_q=eq_q, eq_match_blend=eq_match_blend, oversample_mode=oversample_mode,
+        match_loudness=match_loudness, match_dynamics=match_dynamics,
         match_stereo_width=match_stereo_width, hp_cutoff=hp_cutoff,
         limiter_release_ms=limiter_release_ms, output_format=output_format,
         dynamics_margin_db=dynamics_margin_db, stereo_blend=stereo_blend,
@@ -785,6 +799,9 @@ async def master_with_reference(
     eq_max_boost_db: float     = Query(6.0,  ge=0.0,  le=18.0),
     eq_max_cut_db: float       = Query(-9.0, ge=-24.0, le=0.0),
     eq_q: float                = Query(1.3,  ge=0.3,  le=6.0),
+    eq_match_blend: float      = Query(0.75, ge=0.0,  le=1.0,
+                                       description="Cantidad de EQ match a aplicar (0=no toca, 1=matching completo)"),
+    oversample_mode: str       = Query("quality", pattern="^(off|draft|fast|quality|ultra)$"),
     match_loudness: bool       = Query(True),
     match_dynamics: bool       = Query(True),
     match_stereo_width: bool   = Query(True),
@@ -808,6 +825,7 @@ async def master_with_reference(
     with open(reference_path, "wb") as f: f.write(ref_data)
 
     params = _read_reference_params(eq_bands, eq_max_boost_db, eq_max_cut_db, eq_q,
+                                    eq_match_blend, oversample_mode,
                                     match_loudness, match_dynamics, match_stereo_width,
                                     hp_cutoff, limiter_release_ms, output_format,
                                     dynamics_margin_db, stereo_blend)
@@ -827,6 +845,9 @@ async def master_with_reference_sync(
     eq_max_boost_db: float     = Query(6.0,  ge=0.0,  le=18.0),
     eq_max_cut_db: float       = Query(-9.0, ge=-24.0, le=0.0),
     eq_q: float                = Query(1.3,  ge=0.3,  le=6.0),
+    eq_match_blend: float      = Query(0.75, ge=0.0,  le=1.0,
+                                       description="Cantidad de EQ match a aplicar (0=no toca, 1=matching completo)"),
+    oversample_mode: str       = Query("quality", pattern="^(off|draft|fast|quality|ultra)$"),
     match_loudness: bool       = Query(True),
     match_dynamics: bool       = Query(True),
     match_stereo_width: bool   = Query(True),
@@ -851,7 +872,8 @@ async def master_with_reference_sync(
         result = await run_in_threadpool(
             process_audio_with_reference, tmp, tmp_ref,
             eq_bands=eq_bands, eq_max_boost_db=eq_max_boost_db, eq_max_cut_db=eq_max_cut_db,
-            eq_q=eq_q, match_loudness=match_loudness, match_dynamics=match_dynamics,
+            eq_q=eq_q, eq_match_blend=eq_match_blend, oversample_mode=oversample_mode,
+            match_loudness=match_loudness, match_dynamics=match_dynamics,
             match_stereo_width=match_stereo_width, hp_cutoff=hp_cutoff,
             limiter_release_ms=limiter_release_ms, output_format=output_format,
             preview_seconds=preview_seconds,
